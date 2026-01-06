@@ -2,7 +2,7 @@
 import { google, docs_v1 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { UserError } from 'fastmcp';
-import { TextStyleArgs, ParagraphStyleArgs, hexToRgbColor, NotImplementedError } from './types.js';
+import { TextStyleArgs, ParagraphStyleArgs, hexToRgbColor, NotImplementedError, ParsedMarkdownTable } from './types.js';
 
 type Docs = docs_v1.Docs; // Alias for convenience
 
@@ -707,4 +707,263 @@ export function findTabById(doc: docs_v1.Schema$Document, tabId: string): docs_v
     };
 
     return searchTabs(doc.tabs);
+}
+
+// --- Markdown Table Helpers ---
+
+/**
+ * Parses a markdown table string into a structured format
+ * @param markdown - The markdown table string
+ * @returns ParsedMarkdownTable with headers, rows, dimensions, and alignments
+ */
+export function parseMarkdownTable(markdown: string): ParsedMarkdownTable {
+    const lines = markdown
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0);
+
+    if (lines.length === 0) {
+        throw new UserError('Markdown table is empty');
+    }
+
+    // Parse function for a single row
+    const parseRow = (line: string): string[] => {
+        // Remove leading/trailing pipes if present
+        let trimmed = line;
+        if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+        if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1);
+
+        // Split by pipe (not escaped), then unescape any escaped pipes
+        const cells = trimmed.split(/(?<!\\)\|/).map(cell =>
+            cell.trim().replace(/\\\|/g, '|')
+        );
+        return cells;
+    };
+
+    // Check if a line is a separator row (contains only |, -, :, and spaces)
+    const isSeparatorRow = (line: string): boolean => {
+        return /^\|?[\s\-:]+(\|[\s\-:]+)*\|?$/.test(line);
+    };
+
+    // Parse alignment from separator row
+    const parseAlignments = (line: string): ('left' | 'center' | 'right' | null)[] => {
+        const cells = parseRow(line);
+        return cells.map(cell => {
+            const trimmed = cell.trim();
+            if (trimmed.startsWith(':') && trimmed.endsWith(':')) return 'center';
+            if (trimmed.endsWith(':')) return 'right';
+            if (trimmed.startsWith(':')) return 'left';
+            return null;
+        });
+    };
+
+    let headers: string[] = [];
+    let rows: string[][] = [];
+    let alignments: ('left' | 'center' | 'right' | null)[] = [];
+    let dataStartIndex = 1;
+
+    // First line is always headers
+    headers = parseRow(lines[0]);
+
+    // Check if second line is separator
+    if (lines.length > 1 && isSeparatorRow(lines[1])) {
+        alignments = parseAlignments(lines[1]);
+        dataStartIndex = 2;
+    }
+
+    // Parse remaining rows
+    for (let i = dataStartIndex; i < lines.length; i++) {
+        if (!isSeparatorRow(lines[i])) {
+            rows.push(parseRow(lines[i]));
+        }
+    }
+
+    // Normalize column counts to the maximum found
+    const maxColumns = Math.max(
+        headers.length,
+        ...rows.map(r => r.length),
+        alignments.length
+    );
+
+    // Pad arrays to match max columns
+    while (headers.length < maxColumns) headers.push('');
+    rows = rows.map(row => {
+        while (row.length < maxColumns) row.push('');
+        return row;
+    });
+    while (alignments.length < maxColumns) alignments.push(null);
+
+    return {
+        headers,
+        rows,
+        columnCount: maxColumns,
+        rowCount: rows.length + 1,  // +1 for header row
+        alignments
+    };
+}
+
+/**
+ * Gets the cell indices from a table structure in a document
+ * @param docs - Google Docs API client
+ * @param documentId - The document ID
+ * @param tableStartIndex - Approximate start index where the table was inserted
+ * @returns Array of cell info with row, col, and startIndex for each cell
+ */
+export async function getTableCellIndices(
+    docs: Docs,
+    documentId: string,
+    tableStartIndex: number
+): Promise<{ row: number; col: number; startIndex: number; endIndex: number }[]> {
+    const res = await docs.documents.get({
+        documentId,
+        fields: 'body(content(startIndex,endIndex,table(tableRows(tableCells(content(startIndex,endIndex))))))'
+    });
+
+    if (!res.data.body?.content) {
+        throw new UserError('Document body is empty');
+    }
+
+    // Find the table at or near the specified start index
+    let targetTable: any = null;
+    let foundTableStart: number | undefined;
+
+    for (const element of res.data.body.content) {
+        const elemStart = element.startIndex;
+        if (element.table && elemStart !== undefined && elemStart !== null) {
+            // Table might be at or just after tableStartIndex due to insertion behavior
+            if (elemStart >= tableStartIndex - 1 &&
+                elemStart <= tableStartIndex + 10) {
+                targetTable = element.table;
+                foundTableStart = elemStart;
+                break;
+            }
+        }
+    }
+
+    if (!targetTable || !targetTable.tableRows) {
+        throw new UserError(`Could not find table at or near index ${tableStartIndex}. Found table at: ${foundTableStart}`);
+    }
+
+    const cellIndices: { row: number; col: number; startIndex: number; endIndex: number }[] = [];
+
+    targetTable.tableRows.forEach((row: any, rowIndex: number) => {
+        if (row.tableCells) {
+            row.tableCells.forEach((cell: any, colIndex: number) => {
+                if (cell.content && cell.content.length > 0) {
+                    // First paragraph in cell has the insertion point
+                    const firstParagraph = cell.content[0];
+                    if (firstParagraph.startIndex !== undefined) {
+                        cellIndices.push({
+                            row: rowIndex,
+                            col: colIndex,
+                            startIndex: firstParagraph.startIndex,
+                            endIndex: firstParagraph.endIndex || firstParagraph.startIndex + 1
+                        });
+                    }
+                }
+            });
+        }
+    });
+
+    return cellIndices;
+}
+
+/**
+ * Creates a table from parsed markdown data and populates cells
+ * @param docs - Google Docs API client
+ * @param documentId - The document ID
+ * @param parsedTable - Parsed markdown table structure
+ * @param insertionIndex - Index where to insert the table
+ * @param applyHeaderStyle - Whether to bold the header row
+ * @returns Batch update response
+ */
+export async function createTableFromMarkdown(
+    docs: Docs,
+    documentId: string,
+    parsedTable: ParsedMarkdownTable,
+    insertionIndex: number,
+    applyHeaderStyle: boolean = true
+): Promise<docs_v1.Schema$BatchUpdateDocumentResponse> {
+
+    // Step 1: Create the empty table
+    const createTableRequest: docs_v1.Schema$Request = {
+        insertTable: {
+            location: { index: insertionIndex },
+            rows: parsedTable.rowCount,
+            columns: parsedTable.columnCount
+        }
+    };
+
+    await executeBatchUpdate(docs, documentId, [createTableRequest]);
+
+    // Step 2: Re-fetch document to get actual cell indices
+    const cellIndices = await getTableCellIndices(docs, documentId, insertionIndex);
+
+    const expectedCellCount = parsedTable.rowCount * parsedTable.columnCount;
+    if (cellIndices.length !== expectedCellCount) {
+        console.warn(`Expected ${expectedCellCount} cells, found ${cellIndices.length}`);
+    }
+
+    // Step 3: Build all cell data (header row + data rows)
+    const allRows = [parsedTable.headers, ...parsedTable.rows];
+
+    // Step 4: Build insert text requests in REVERSE order (bottom-right to top-left)
+    // This prevents index shifting issues when inserting text
+    const textRequests: docs_v1.Schema$Request[] = [];
+
+    // Sort cell indices by row desc, then col desc for reverse insertion
+    const sortedCells = [...cellIndices].sort((a, b) => {
+        if (a.row !== b.row) return b.row - a.row;
+        return b.col - a.col;
+    });
+
+    for (const cell of sortedCells) {
+        const content = allRows[cell.row]?.[cell.col] || '';
+        if (content) {
+            textRequests.push({
+                insertText: {
+                    location: { index: cell.startIndex },
+                    text: content
+                }
+            });
+        }
+    }
+
+    // Step 5: Execute text insertions
+    let result: docs_v1.Schema$BatchUpdateDocumentResponse = {};
+    if (textRequests.length > 0) {
+        result = await executeBatchUpdate(docs, documentId, textRequests);
+    }
+
+    // Step 6: Optionally apply header styling (bold)
+    if (applyHeaderStyle && parsedTable.headers.some(h => h.length > 0)) {
+        // Re-fetch to get updated indices after text insertion
+        const updatedCellIndices = await getTableCellIndices(docs, documentId, insertionIndex);
+
+        const headerStyleRequests: docs_v1.Schema$Request[] = [];
+
+        for (const cell of updatedCellIndices) {
+            if (cell.row === 0) {  // Header row
+                const content = parsedTable.headers[cell.col] || '';
+                if (content.length > 0) {
+                    headerStyleRequests.push({
+                        updateTextStyle: {
+                            range: {
+                                startIndex: cell.startIndex,
+                                endIndex: cell.startIndex + content.length
+                            },
+                            textStyle: { bold: true },
+                            fields: 'bold'
+                        }
+                    });
+                }
+            }
+        }
+
+        if (headerStyleRequests.length > 0) {
+            result = await executeBatchUpdate(docs, documentId, headerStyleRequests);
+        }
+    }
+
+    return result;
 }

@@ -125,6 +125,16 @@ styleArgs => Object.values(styleArgs).some(v => v !== undefined),
 });
 export type ApplyParagraphStyleToolArgs = z.infer<typeof ApplyParagraphStyleToolParameters>;
 
+// --- Markdown Table Types ---
+
+export interface ParsedMarkdownTable {
+    headers: string[];
+    rows: string[][];
+    columnCount: number;
+    rowCount: number;  // Includes header row
+    alignments: ('left' | 'center' | 'right' | null)[];
+}
+
 // --- Error Class ---
 // Use FastMCP's UserError for client-facing issues
 // Define a custom error for internal issues if needed

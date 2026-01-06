@@ -861,6 +861,59 @@ throw new UserError(`Failed to insert table: ${error.message || 'Unknown error'}
 });
 
 server.addTool({
+name: 'createTableFromMarkdown',
+description: 'Creates a Google Docs table from markdown table syntax. Parses the markdown, creates the table structure, and populates all cells with content. Optionally applies bold formatting to the header row.',
+parameters: z.object({
+    documentId: z.string().describe('The ID of the Google Document.'),
+    markdownTable: z.string().min(1).describe(
+        'Markdown table string with pipe-delimited rows. Example:\n' +
+        '| Header 1 | Header 2 |\n' +
+        '|----------|----------|\n' +
+        '| Cell 1   | Cell 2   |'
+    ),
+    index: z.number().int().min(1).describe('The index (1-based) where the table should be inserted.'),
+    applyHeaderStyle: z.boolean().optional().default(true).describe('If true, applies bold formatting to the header row. Defaults to true.')
+}),
+execute: async (args, { log }) => {
+    const docs = await getDocsClient();
+    log.info(`Creating table from markdown in doc ${args.documentId} at index ${args.index}`);
+
+    try {
+        // Step 1: Parse the markdown table
+        log.info('Parsing markdown table...');
+        const parsedTable = GDocsHelpers.parseMarkdownTable(args.markdownTable);
+        log.info(`Parsed table: ${parsedTable.rowCount} rows x ${parsedTable.columnCount} columns`);
+
+        // Validate parsed results
+        if (parsedTable.columnCount === 0) {
+            throw new UserError('Markdown table has no columns. Check the format.');
+        }
+        if (parsedTable.rowCount === 0) {
+            throw new UserError('Markdown table has no rows. Check the format.');
+        }
+
+        // Step 2: Create table and populate cells
+        log.info('Creating and populating table...');
+        await GDocsHelpers.createTableFromMarkdown(
+            docs,
+            args.documentId,
+            parsedTable,
+            args.index,
+            args.applyHeaderStyle ?? true
+        );
+
+        const headerInfo = args.applyHeaderStyle !== false ? ' Header row styled as bold.' : '';
+        return `Successfully created ${parsedTable.rowCount}x${parsedTable.columnCount} table from markdown at index ${args.index}.${headerInfo}`;
+
+    } catch (error: any) {
+        log.error(`Error creating table from markdown: ${error.message || error}`);
+        if (error instanceof UserError) throw error;
+        throw new UserError(`Failed to create table from markdown: ${error.message || 'Unknown error'}`);
+    }
+}
+});
+
+server.addTool({
 name: 'editTableCell',
 description: 'Edits the content and/or basic style of a specific table cell. Requires knowing table start index.',
 parameters: DocumentIdParameter.extend({
