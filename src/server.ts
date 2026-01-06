@@ -1700,16 +1700,17 @@ try {
 
 server.addTool({
 name: 'listFolderContents',
-description: 'Lists the contents of a specific folder in Google Drive.',
+description: 'Lists the contents of a specific folder in Google Drive, including Shared Drives.',
 parameters: z.object({
-  folderId: z.string().describe('ID of the folder to list contents of. Use "root" for the root Drive folder.'),
+  folderId: z.string().describe('ID of the folder to list contents of. Use "root" for the root Drive folder, or a Shared Drive ID for Shared Drives.'),
   includeSubfolders: z.boolean().optional().default(true).describe('Whether to include subfolders in results.'),
   includeFiles: z.boolean().optional().default(true).describe('Whether to include files in results.'),
   maxResults: z.number().int().min(1).max(100).optional().default(50).describe('Maximum number of items to return.'),
+  driveId: z.string().optional().describe('Optional: The ID of a Shared Drive. When provided, queries are scoped to that Shared Drive.'),
 }),
 execute: async (args, { log }) => {
 const drive = await getDriveClient();
-log.info(`Listing contents of folder: ${args.folderId}`);
+log.info(`Listing contents of folder: ${args.folderId}${args.driveId ? ` (Shared Drive: ${args.driveId})` : ''}`);
 
 try {
   let queryString = `'${args.folderId}' in parents and trashed=false`;
@@ -1725,12 +1726,23 @@ try {
     queryString += ` and mimeType='application/vnd.google-apps.folder'`;
   }
 
-  const response = await drive.files.list({
+  // Build request options with Shared Drive support
+  const listOptions: any = {
     q: queryString,
     pageSize: args.maxResults,
     orderBy: 'folder,name',
-    fields: 'files(id,name,mimeType,size,modifiedTime,webViewLink,owners(displayName))',
-  });
+    fields: 'files(id,name,mimeType,size,modifiedTime,webViewLink,owners(displayName),driveId)',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+  };
+
+  // If a specific Shared Drive is specified, scope the query to it
+  if (args.driveId) {
+    listOptions.driveId = args.driveId;
+    listOptions.corpora = 'drive';
+  }
+
+  const response = await drive.files.list(listOptions);
 
   const items = response.data.files || [];
 
@@ -1782,7 +1794,7 @@ try {
 
 server.addTool({
 name: 'getFolderInfo',
-description: 'Gets detailed information about a specific folder in Google Drive.',
+description: 'Gets detailed information about a specific folder in Google Drive, including folders in Shared Drives.',
 parameters: z.object({
   folderId: z.string().describe('ID of the folder to get information about.'),
 }),
@@ -1793,7 +1805,8 @@ log.info(`Getting folder info: ${args.folderId}`);
 try {
   const response = await drive.files.get({
     fileId: args.folderId,
-    fields: 'id,name,description,createdTime,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName),shared,parents',
+    fields: 'id,name,description,mimeType,createdTime,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName),shared,parents,driveId',
+    supportsAllDrives: true,
   });
 
   const folder = response.data;
@@ -1810,6 +1823,12 @@ try {
   let result = `**Folder Information:**\n\n`;
   result += `**Name:** ${folder.name}\n`;
   result += `**ID:** ${folder.id}\n`;
+
+  // Show if this folder is in a Shared Drive
+  if (folder.driveId) {
+    result += `**Shared Drive ID:** ${folder.driveId}\n`;
+  }
+
   result += `**Created:** ${createdDate}\n`;
   result += `**Last Modified:** ${modifiedDate}\n`;
 
