@@ -1700,17 +1700,18 @@ try {
 
 server.addTool({
 name: 'listFolderContents',
-description: 'Lists the contents of a specific folder in Google Drive, including Shared Drives.',
+description: 'Lists the contents of a specific folder in Google Drive, including Shared Drives. Supports pagination for folders with many items.',
 parameters: z.object({
   folderId: z.string().describe('ID of the folder to list contents of. Use "root" for the root Drive folder, or a Shared Drive ID for Shared Drives.'),
   includeSubfolders: z.boolean().optional().default(true).describe('Whether to include subfolders in results.'),
   includeFiles: z.boolean().optional().default(true).describe('Whether to include files in results.'),
-  maxResults: z.number().int().min(1).max(100).optional().default(50).describe('Maximum number of items to return.'),
+  maxItems: z.number().int().min(1).max(1000).optional().default(100).describe('Maximum number of items to return (up to 1000). For folders with more items, use pageToken to get next page.'),
+  pageToken: z.string().optional().describe('Token for fetching the next page of results. Returned as nextPageToken when more items exist.'),
   driveId: z.string().optional().describe('Optional: The ID of a Shared Drive. When provided, queries are scoped to that Shared Drive.'),
 }),
 execute: async (args, { log }) => {
 const drive = await getDriveClient();
-log.info(`Listing contents of folder: ${args.folderId}${args.driveId ? ` (Shared Drive: ${args.driveId})` : ''}`);
+log.info(`Listing contents of folder: ${args.folderId}${args.driveId ? ` (Shared Drive: ${args.driveId})` : ''}${args.pageToken ? ' (next page)' : ''}`);
 
 try {
   let queryString = `'${args.folderId}' in parents and trashed=false`;
@@ -1726,35 +1727,57 @@ try {
     queryString += ` and mimeType='application/vnd.google-apps.folder'`;
   }
 
-  // Build request options with Shared Drive support
-  const listOptions: any = {
-    q: queryString,
-    pageSize: args.maxResults,
-    orderBy: 'folder,name',
-    fields: 'files(id,name,mimeType,size,modifiedTime,webViewLink,owners(displayName),driveId)',
-    supportsAllDrives: true,
-    includeItemsFromAllDrives: true,
-  };
+  // Collect all items across pages
+  const allItems: any[] = [];
+  let nextPageToken: string | undefined = args.pageToken;
+  const maxItems = args.maxItems || 100;
+  const pageSize = Math.min(100, maxItems); // API max is 100 per request
 
-  // If a specific Shared Drive is specified, scope the query to it
-  if (args.driveId) {
-    listOptions.driveId = args.driveId;
-    listOptions.corpora = 'drive';
+  // Fetch pages until we have enough items or run out of pages
+  while (allItems.length < maxItems) {
+    const listOptions: any = {
+      q: queryString,
+      pageSize: Math.min(pageSize, maxItems - allItems.length),
+      orderBy: 'folder,name',
+      fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,owners(displayName),driveId)',
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+    };
+
+    // If a specific Shared Drive is specified, scope the query to it
+    if (args.driveId) {
+      listOptions.driveId = args.driveId;
+      listOptions.corpora = 'drive';
+    }
+
+    // Add page token if we have one
+    if (nextPageToken) {
+      listOptions.pageToken = nextPageToken;
+    }
+
+    const response = await drive.files.list(listOptions);
+    const pageItems = response.data.files || [];
+    allItems.push(...pageItems);
+
+    nextPageToken = response.data.nextPageToken || undefined;
+
+    // Stop if no more pages
+    if (!nextPageToken) {
+      break;
+    }
+
+    log.info(`Fetched ${allItems.length} items so far, continuing to next page...`);
   }
 
-  const response = await drive.files.list(listOptions);
-
-  const items = response.data.files || [];
-
-  if (items.length === 0) {
+  if (allItems.length === 0) {
     return "The folder is empty or you don't have permission to view its contents.";
   }
 
-  let result = `Contents of folder (${items.length} item${items.length !== 1 ? 's' : ''}):\n\n`;
+  let result = `Contents of folder (${allItems.length} item${allItems.length !== 1 ? 's' : ''}):\n\n`;
 
   // Separate folders and files
-  const folders = items.filter(item => item.mimeType === 'application/vnd.google-apps.folder');
-  const files = items.filter(item => item.mimeType !== 'application/vnd.google-apps.folder');
+  const folders = allItems.filter(item => item.mimeType === 'application/vnd.google-apps.folder');
+  const files = allItems.filter(item => item.mimeType !== 'application/vnd.google-apps.folder');
 
   // List folders first
   if (folders.length > 0 && args.includeSubfolders) {
@@ -1767,7 +1790,7 @@ try {
 
   // Then list files
   if (files.length > 0 && args.includeFiles) {
-    result += `**Files (${files.length}):\n`;
+    result += `**Files (${files.length}):**\n`;
     files.forEach(file => {
       const fileType = file.mimeType === 'application/vnd.google-apps.document' ? '📄' :
                       file.mimeType === 'application/vnd.google-apps.spreadsheet' ? '📊' :
@@ -1780,6 +1803,11 @@ try {
       result += `   Modified: ${modifiedDate} by ${owner}\n`;
       result += `   Link: ${file.webViewLink}\n\n`;
     });
+  }
+
+  // Include next page token if there are more results
+  if (nextPageToken) {
+    result += `---\n**More items available.** Use this token to fetch the next page:\n\`nextPageToken: ${nextPageToken}\`\n`;
   }
 
   return result;
