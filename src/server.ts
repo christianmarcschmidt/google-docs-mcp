@@ -1437,6 +1437,7 @@ parameters: z.object({
   maxResults: z.number().int().min(1).max(100).optional().default(20).describe('Maximum number of documents to return (1-100).'),
   query: z.string().optional().describe('Search query to filter documents by name or content.'),
   orderBy: z.enum(['name', 'modifiedTime', 'createdTime']).optional().default('modifiedTime').describe('Sort order for results.'),
+  format: z.enum(['text', 'json']).optional().default('text').describe("Output format: 'text' (human-readable, default) or 'json' (structured array of file objects)."),
 }),
 execute: async (args, { log }) => {
 const drive = await getDriveClient();
@@ -1459,7 +1460,11 @@ try {
   const files = response.data.files || [];
 
   if (files.length === 0) {
-    return "No Google Docs found matching your criteria.";
+    return args.format === 'json' ? '[]' : "No Google Docs found matching your criteria.";
+  }
+
+  if (args.format === 'json') {
+    return JSON.stringify(files, null, 2);
   }
 
   let result = `Found ${files.length} Google Document(s):\n\n`;
@@ -1490,6 +1495,7 @@ parameters: z.object({
   searchIn: z.enum(['name', 'content', 'both']).optional().default('both').describe('Where to search: document names, content, or both.'),
   maxResults: z.number().int().min(1).max(50).optional().default(10).describe('Maximum number of results to return.'),
   modifiedAfter: z.string().optional().describe('Only return documents modified after this date (ISO 8601 format, e.g., "2024-01-01").'),
+  format: z.enum(['text', 'json']).optional().default('text').describe("Output format: 'text' (human-readable, default) or 'json' (structured array of file objects)."),
 }),
 execute: async (args, { log }) => {
 const drive = await getDriveClient();
@@ -1522,7 +1528,11 @@ try {
   const files = response.data.files || [];
 
   if (files.length === 0) {
-    return `No Google Docs found containing "${args.searchQuery}".`;
+    return args.format === 'json' ? '[]' : `No Google Docs found containing "${args.searchQuery}".`;
+  }
+
+  if (args.format === 'json') {
+    return JSON.stringify(files, null, 2);
   }
 
   let result = `Found ${files.length} document(s) matching "${args.searchQuery}":\n\n`;
@@ -1551,6 +1561,7 @@ description: 'Gets the most recently modified Google Documents.',
 parameters: z.object({
   maxResults: z.number().int().min(1).max(50).optional().default(10).describe('Maximum number of recent documents to return.'),
   daysBack: z.number().int().min(1).max(365).optional().default(30).describe('Only show documents modified within this many days.'),
+  format: z.enum(['text', 'json']).optional().default('text').describe("Output format: 'text' (human-readable, default) or 'json' (structured array of file objects)."),
 }),
 execute: async (args, { log }) => {
 const drive = await getDriveClient();
@@ -1573,7 +1584,11 @@ try {
   const files = response.data.files || [];
 
   if (files.length === 0) {
-    return `No Google Docs found that were modified in the last ${args.daysBack} days.`;
+    return args.format === 'json' ? '[]' : `No Google Docs found that were modified in the last ${args.daysBack} days.`;
+  }
+
+  if (args.format === 'json') {
+    return JSON.stringify(files, null, 2);
   }
 
   let result = `${files.length} recently modified Google Document(s) (last ${args.daysBack} days):\n\n`;
@@ -1601,7 +1616,9 @@ try {
 server.addTool({
 name: 'getDocumentInfo',
 description: 'Gets detailed information about a specific Google Document.',
-parameters: DocumentIdParameter,
+parameters: DocumentIdParameter.extend({
+  format: z.enum(['text', 'json']).optional().default('text').describe("Output format: 'text' (human-readable, default) or 'json' (raw file metadata object)."),
+}),
 execute: async (args, { log }) => {
 const drive = await getDriveClient();
 log.info(`Getting info for document: ${args.documentId}`);
@@ -1618,6 +1635,10 @@ try {
 
   if (!file) {
     throw new UserError(`Document with ID ${args.documentId} not found.`);
+  }
+
+  if (args.format === 'json') {
+    return JSON.stringify(file, null, 2);
   }
 
   const createdDate = file.createdTime ? new Date(file.createdTime).toLocaleString() : 'Unknown';
@@ -1705,9 +1726,12 @@ parameters: z.object({
   folderId: z.string().describe('ID of the folder to list contents of. Use "root" for the root Drive folder, or a Shared Drive ID for Shared Drives.'),
   includeSubfolders: z.boolean().optional().default(true).describe('Whether to include subfolders in results.'),
   includeFiles: z.boolean().optional().default(true).describe('Whether to include files in results.'),
-  maxItems: z.number().int().min(1).max(1000).optional().default(100).describe('Maximum number of items to return (up to 1000). For folders with more items, use pageToken to get next page.'),
+  recursive: z.boolean().optional().default(false).describe('When true, recursively lists contents of all subfolders (JSON format only). Subfolder items are flattened into a single files array with a _folderPath field showing their location.'),
+  mimeTypeFilter: z.string().optional().describe('Filter results to a specific MIME type (e.g. "application/vnd.google-apps.document" for Google Docs only). Folders are always included when recursive=true so traversal works.'),
+  maxItems: z.number().int().min(1).max(5000).optional().default(100).describe('Maximum number of items to return (up to 5000). For folders with more items, use pageToken to get next page.'),
   pageToken: z.string().optional().describe('Token for fetching the next page of results. Returned as nextPageToken when more items exist.'),
   driveId: z.string().optional().describe('Optional: The ID of a Shared Drive. When provided, queries are scoped to that Shared Drive.'),
+  format: z.enum(['text', 'json']).optional().default('text').describe("Output format: 'text' (human-readable, default) or 'json' (structured object with files array and optional nextPageToken)."),
 }),
 execute: async (args, { log }) => {
 const drive = await getDriveClient();
@@ -1727,6 +1751,15 @@ try {
     queryString += ` and mimeType='application/vnd.google-apps.folder'`;
   }
 
+  // Apply MIME type filter (always allow folders through when recursive so traversal works)
+  if (args.mimeTypeFilter) {
+    if (args.recursive) {
+      queryString += ` and (mimeType='${args.mimeTypeFilter}' or mimeType='application/vnd.google-apps.folder')`;
+    } else {
+      queryString += ` and mimeType='${args.mimeTypeFilter}'`;
+    }
+  }
+
   // Collect all items across pages
   const allItems: any[] = [];
   let nextPageToken: string | undefined = args.pageToken;
@@ -1739,7 +1772,7 @@ try {
       q: queryString,
       pageSize: Math.min(pageSize, maxItems - allItems.length),
       orderBy: 'folder,name',
-      fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,owners(displayName),driveId)',
+      fields: 'nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,owners(displayName),driveId)',
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
     };
@@ -1769,8 +1802,67 @@ try {
     log.info(`Fetched ${allItems.length} items so far, continuing to next page...`);
   }
 
+  // Recursive mode: descend into subfolders and collect all files
+  if (args.recursive && args.format === 'json') {
+    const folders = allItems.filter((item: any) => item.mimeType === 'application/vnd.google-apps.folder');
+    const files = allItems.filter((item: any) => item.mimeType !== 'application/vnd.google-apps.folder');
+
+    // BFS through subfolders
+    const queue = folders.map((f: any) => ({ id: f.id, path: f.name }));
+    while (queue.length > 0) {
+      const folder = queue.shift()!;
+      log.info(`Recursing into folder: ${folder.path}`);
+
+      let subPageToken: string | undefined;
+      do {
+        let subQuery = `'${folder.id}' in parents and trashed=false`;
+        if (args.mimeTypeFilter) {
+          subQuery += ` and (mimeType='${args.mimeTypeFilter}' or mimeType='application/vnd.google-apps.folder')`;
+        }
+        const subOptions: any = {
+          q: subQuery,
+          pageSize: 100,
+          orderBy: 'folder,name',
+          fields: 'nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,owners(displayName),driveId)',
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+        };
+        if (args.driveId) {
+          subOptions.driveId = args.driveId;
+          subOptions.corpora = 'drive';
+        }
+        if (subPageToken) subOptions.pageToken = subPageToken;
+
+        const subResponse = await drive.files.list(subOptions);
+        const subItems = subResponse.data.files || [];
+
+        for (const item of subItems) {
+          (item as any)._folderPath = folder.path;
+          if (item.mimeType === 'application/vnd.google-apps.folder') {
+            queue.push({ id: item.id!, path: `${folder.path}/${item.name}` });
+          } else {
+            files.push(item);
+          }
+        }
+
+        subPageToken = subResponse.data.nextPageToken || undefined;
+      } while (subPageToken);
+    }
+
+    return JSON.stringify({ files }, null, 2);
+  }
+
   if (allItems.length === 0) {
-    return "The folder is empty or you don't have permission to view its contents.";
+    return args.format === 'json'
+      ? JSON.stringify({ files: [], nextPageToken: nextPageToken || undefined }, null, 2)
+      : "The folder is empty or you don't have permission to view its contents.";
+  }
+
+  if (args.format === 'json') {
+    return JSON.stringify({
+      files: allItems,
+      ...(nextPageToken ? { nextPageToken } : {}),
+    }, null, 2);
   }
 
   let result = `Contents of folder (${allItems.length} item${allItems.length !== 1 ? 's' : ''}):\n\n`;
@@ -2469,6 +2561,7 @@ parameters: z.object({
   maxResults: z.number().int().min(1).max(100).optional().default(20).describe('Maximum number of spreadsheets to return (1-100).'),
   query: z.string().optional().describe('Search query to filter spreadsheets by name or content.'),
   orderBy: z.enum(['name', 'modifiedTime', 'createdTime']).optional().default('modifiedTime').describe('Sort order for results.'),
+  format: z.enum(['text', 'json']).optional().default('text').describe("Output format: 'text' (human-readable, default) or 'json' (structured array of file objects)."),
 }),
 execute: async (args, { log }) => {
   const drive = await getDriveClient();
@@ -2491,7 +2584,11 @@ execute: async (args, { log }) => {
     const files = response.data.files || [];
 
     if (files.length === 0) {
-      return "No Google Spreadsheets found matching your criteria.";
+      return args.format === 'json' ? '[]' : "No Google Spreadsheets found matching your criteria.";
+    }
+
+    if (args.format === 'json') {
+      return JSON.stringify(files, null, 2);
     }
 
     let result = `Found ${files.length} Google Spreadsheet(s):\n\n`;
